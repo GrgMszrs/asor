@@ -1,0 +1,62 @@
+name: asor
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: asor
+      POSTGRES_PASSWORD: asor
+      POSTGRES_DB: asor
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asor"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  agent-runner-build:
+    image: asor-agent-runner:dev
+    build:
+      context: ../../apps/agent-runner
+      dockerfile: Dockerfile
+    command: ["true"]
+    profiles: ["build-only"]
+
+  api:
+    image: asor-api:dev
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    env_file:
+      - ../../.env
+    environment:
+      ASOR_API_BASE_URL: http://api:8000
+      ASOR_AGENT_RUNNER_IMAGE: asor-agent-runner:dev
+      ASOR_RUNNER_NETWORK: asor_default
+      DATABASE_URL: postgresql+psycopg://asor:asor@postgres:5432/asor
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    image: asor-web:dev
+    build:
+      context: ../..
+      dockerfile: infra/docker/web.Dockerfile
+    environment:
+      ASOR_API_URL: http://api:8000
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  postgres-data:
