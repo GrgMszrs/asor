@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv/
+
+# Node / Next / Bun
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.bun/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Claude / Gemini local state
+.claude/settings.local.json
+.claude/worktrees/
+.gemini/sessions/
+.gemini/tmp/
+
+# Test/coverage
+.coverage
+.pytest_cache/
+htmlcov/
