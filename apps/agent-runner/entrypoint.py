@@ -88,6 +88,9 @@ def main() -> int:
         os.environ.pop("GOOGLE_API_KEY", None)
 
     cmd = [
+        "stdbuf",
+        "-oL",
+        "-eL",
         "gemini",
         "-p",
         prompt,
