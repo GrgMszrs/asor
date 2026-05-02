@@ -17,7 +17,9 @@ type Event = {
 type Run = {
   id: string;
   task_id: string;
+  parent_run_id?: string | null;
   status: string;
+  session_id?: string | null;
   started_at?: string | null;
   finished_at?: string | null;
   final_text?: string | null;
@@ -58,6 +60,11 @@ const EVENT_KIND_COLORS: Record<string, string> = {
 const STORAGE_KEY_RUN = "asor.activeRunId";
 const STORAGE_KEY_SIDEBAR = "asor.sidebarWidth";
 
+function apiEventUrl(runId: string): string {
+  if (typeof window === "undefined") return `/api/runs/${runId}/events`;
+  return `${window.location.protocol}//${window.location.hostname}:8000/runs/${runId}/events`;
+}
+
 function asString(v: unknown): string {
   if (v == null) return "";
   if (typeof v === "string") return v;
@@ -89,6 +96,7 @@ function getObj(p: Payload | undefined, ...keys: string[]): Payload | undefined 
 function deriveChat(events: Event[], runFinished: boolean): ChatItem[] {
   const items: ChatItem[] = [];
   const toolCallsByName: Record<string, ChatItem & { kind: "tool" }> = {};
+  const userMessages = new Set<string>();
 
   const pushOrMergeAssistant = (content: string, isDelta: boolean) => {
     const last = items[items.length - 1];
@@ -110,6 +118,11 @@ function deriveChat(events: Event[], runFinished: boolean): ChatItem[] {
       const isDelta = e.payload?.delta === true;
 
       if (role === "user") {
+        if (e.payload?.type === "message" && e.payload?.source !== "asor") {
+          continue;
+        }
+        if (userMessages.has(content)) continue;
+        userMessages.add(content);
         items.push({ kind: "user", content });
         continue;
       }
@@ -164,11 +177,25 @@ function deriveChat(events: Event[], runFinished: boolean): ChatItem[] {
   }
 
   if (runFinished) {
-    const last = items[items.length - 1];
-    if (last && last.kind === "assistant") last.streaming = false;
+    const lastAssistant = [...items].reverse().find((m) => m.kind === "assistant");
+    if (lastAssistant?.kind === "assistant") lastAssistant.streaming = false;
   }
 
   return items;
+}
+
+function mergeEvents(prev: Event[], incoming: Event | Event[]): Event[] {
+  const events = Array.isArray(incoming) ? incoming : [incoming];
+  const byKey = new Map(prev.map((e) => [`${e.run_id}:${e.seq}`, e]));
+  for (const event of events) {
+    byKey.set(`${event.run_id}:${event.seq}`, event);
+  }
+  return [...byKey.values()].sort((a, b) => {
+    const byTime = new Date(a.at).getTime() - new Date(b.at).getTime();
+    if (byTime !== 0) return byTime;
+    if (a.run_id !== b.run_id) return a.run_id.localeCompare(b.run_id);
+    return a.seq - b.seq;
+  });
 }
 
 function deriveTodos(events: Event[]): Todo[] {
@@ -315,12 +342,12 @@ export default function Home() {
   const attachStream = useCallback(
     (run_id: string) => {
       closeStream();
-      const es = new EventSource(`/api/runs/${run_id}/events`);
+      const es = new EventSource(apiEventUrl(run_id));
       esRef.current = es;
       const onEvent = (e: MessageEvent) => {
         try {
           const ev = JSON.parse(e.data) as Event;
-          setEvents((prev) => [...prev, ev]);
+          setEvents((prev) => mergeEvents(prev, ev));
           const status =
             ev.kind === "status" ? (ev.payload?.status as string) : undefined;
           if (status === "succeeded" || status === "failed") {
@@ -357,7 +384,7 @@ export default function Home() {
       try {
         const [runRes, evRes] = await Promise.all([
           fetch(`/api/runs/${id}`, { cache: "no-store" }),
-          fetch(`/api/runs/${id}/events.json`, { cache: "no-store" }),
+          fetch(`/api/runs/${id}/conversation.json`, { cache: "no-store" }),
         ]);
         let run: Run | null = null;
         if (runRes.ok) {
@@ -370,7 +397,10 @@ export default function Home() {
           setActiveRun(null);
           return;
         }
-        if (evRes.ok) setEvents((await evRes.json()) as Event[]);
+        if (evRes.ok) {
+          const loadedEvents = (await evRes.json()) as Event[];
+          setEvents((prev) => mergeEvents(prev, loadedEvents));
+        }
 
         const isTerminal =
           run?.status === "succeeded" ||
@@ -434,7 +464,13 @@ export default function Home() {
     const p = prompt.trim();
     if (!p || busy) return;
     setBusy(true);
-    setEvents([]);
+    const parentRunId =
+      activeRunId &&
+      activeRun?.status !== "running" &&
+      activeRun?.status !== "pending"
+        ? activeRunId
+        : null;
+    if (!parentRunId) setEvents([]);
     setActiveRun(null);
     setExpandedEvent(null);
     setPrompt("");
@@ -442,16 +478,21 @@ export default function Home() {
       const res = await fetch("/api/tasks", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ prompt: p }),
+        body: JSON.stringify({ prompt: p, parent_run_id: parentRunId }),
       });
       const { run_id } = (await res.json()) as { run_id: string };
       setActiveRunId(run_id);
       void refreshRuns();
+      void fetch(`/api/runs/${run_id}`, { cache: "no-store" }).then(
+        async (r) => {
+          if (r.ok) setActiveRun((await r.json()) as Run);
+        }
+      );
       attachStream(run_id);
     } catch {
       setBusy(false);
     }
-  }, [prompt, busy, refreshRuns, attachStream]);
+  }, [prompt, busy, activeRunId, activeRun?.status, refreshRuns, attachStream]);
 
   // Sidebar drag-resize
   useEffect(() => {

@@ -39,13 +39,18 @@ class DockerAgentRunner:
             "ASOR_CALLBACK_URL": callback_url,
             "ASOR_MODEL": run.invocation.model or s.gemini_model,
             "ASOR_EXTENSIONS": ",".join(run.invocation.extensions),
+            "ASOR_RUNNER_TIMEOUT_SECONDS": str(s.asor_runner_timeout_seconds),
+            "ASOR_RESUME_SESSION_ID": run.session_id or "",
+            "TERM": "xterm-256color",
             "GOOGLE_GENAI_USE_VERTEXAI": s.google_genai_use_vertexai,
             "GOOGLE_CLOUD_PROJECT": s.google_cloud_project,
             "GOOGLE_CLOUD_LOCATION": s.google_cloud_location,
             "GOOGLE_APPLICATION_CREDENTIALS": s.runner_adc_mount_path,
         }
 
-        volumes: dict[str, dict[str, str]] = {}
+        volumes: dict[str, dict[str, str]] = {
+            s.asor_gemini_home_volume: {"bind": "/root/.gemini", "mode": "rw"}
+        }
         if s.asor_gcloud_adc_path:
             volumes[s.asor_gcloud_adc_path] = {
                 "bind": s.runner_adc_mount_path,

@@ -10,9 +10,10 @@ COPY apps/api /app/apps/api
 
 ENV UV_HTTP_TIMEOUT=180
 
-RUN uv sync --package asor-api --no-dev
+RUN uv sync --package asor-api --no-dev --no-install-workspace
 
 ENV PATH="/app/.venv/bin:${PATH}"
+ENV PYTHONPATH="/app/apps/api:/app/packages/core"
 
 EXPOSE 8000
 
