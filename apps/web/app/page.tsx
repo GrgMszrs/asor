@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Payload = Record<string, unknown>;
 
@@ -22,13 +24,16 @@ type Run = {
   invocation: { model?: string | null };
 };
 
-type ChatMsg =
+type ChatItem =
   | { kind: "user"; content: string }
   | { kind: "assistant"; content: string; streaming: boolean }
   | { kind: "tool"; toolName: string; args: string; result?: string }
-  | { kind: "error"; content: string };
+  | { kind: "error"; content: string }
+  | { kind: "event"; eventKind: string; summary: string };
 
 type Todo = { content: string; status: string };
+
+type RightTab = "details" | "events";
 
 const EVENT_KINDS = [
   "init",
@@ -39,6 +44,19 @@ const EVENT_KINDS = [
   "result",
   "status",
 ] as const;
+
+const EVENT_KIND_COLORS: Record<string, string> = {
+  init: "text-sky-400 border-sky-900/60 bg-sky-950/30",
+  message: "text-neutral-200 border-neutral-700 bg-neutral-900/60",
+  tool_use: "text-amber-300 border-amber-900/60 bg-amber-950/30",
+  tool_result: "text-emerald-300 border-emerald-900/60 bg-emerald-950/30",
+  error: "text-red-300 border-red-900/60 bg-red-950/30",
+  result: "text-violet-300 border-violet-900/60 bg-violet-950/30",
+  status: "text-indigo-300 border-indigo-900/60 bg-indigo-950/30",
+};
+
+const STORAGE_KEY_RUN = "asor.activeRunId";
+const STORAGE_KEY_SIDEBAR = "asor.sidebarWidth";
 
 function asString(v: unknown): string {
   if (v == null) return "";
@@ -68,36 +86,42 @@ function getObj(p: Payload | undefined, ...keys: string[]): Payload | undefined 
   return undefined;
 }
 
-function deriveChat(events: Event[], runFinished: boolean): ChatMsg[] {
-  const msgs: ChatMsg[] = [];
-  const toolCallsByName: Record<string, ChatMsg & { kind: "tool" }> = {};
+function deriveChat(events: Event[], runFinished: boolean): ChatItem[] {
+  const items: ChatItem[] = [];
+  const toolCallsByName: Record<string, ChatItem & { kind: "tool" }> = {};
+
+  const pushOrMergeAssistant = (content: string, isDelta: boolean) => {
+    const last = items[items.length - 1];
+    if (last && last.kind === "assistant" && last.streaming) {
+      last.content += content;
+      if (!isDelta) last.streaming = false;
+    } else if (last && last.kind === "assistant" && !last.streaming && isDelta) {
+      last.content += content;
+      last.streaming = true;
+    } else {
+      items.push({ kind: "assistant", content, streaming: isDelta });
+    }
+  };
 
   for (const e of events) {
     if (e.kind === "message") {
       const role = getStr(e.payload, "role") ?? "assistant";
-      const content = getStr(e.payload, "content") ?? "";
+      const content = getStr(e.payload, "content", "text") ?? "";
       const isDelta = e.payload?.delta === true;
 
       if (role === "user") {
-        msgs.push({ kind: "user", content });
+        items.push({ kind: "user", content });
         continue;
       }
-
-      const last = msgs[msgs.length - 1];
-      if (last && last.kind === "assistant" && last.streaming) {
-        last.content += content;
-        if (!isDelta) last.streaming = false;
-      } else {
-        msgs.push({ kind: "assistant", content, streaming: isDelta });
-      }
+      pushOrMergeAssistant(content, isDelta);
     } else if (e.kind === "tool_use") {
       const toolName =
         getStr(e.payload, "name", "tool", "tool_name") ?? "tool";
       const argsObj =
         getObj(e.payload, "args", "input", "arguments", "params") ?? e.payload ?? {};
       const args = JSON.stringify(argsObj, null, 2);
-      const tool: ChatMsg & { kind: "tool" } = { kind: "tool", toolName, args };
-      msgs.push(tool);
+      const tool: ChatItem & { kind: "tool" } = { kind: "tool", toolName, args };
+      items.push(tool);
       const toolId = getStr(e.payload, "id", "call_id", "tool_call_id");
       if (toolId) toolCallsByName[toolId] = tool;
     } else if (e.kind === "tool_result") {
@@ -108,24 +132,43 @@ function deriveChat(events: Event[], runFinished: boolean): ChatMsg[] {
       if (toolId && toolCallsByName[toolId]) {
         toolCallsByName[toolId].result = result;
       } else {
-        const lastTool = [...msgs].reverse().find((m) => m.kind === "tool") as
-          | (ChatMsg & { kind: "tool" })
+        const lastTool = [...items].reverse().find((m) => m.kind === "tool") as
+          | (ChatItem & { kind: "tool" })
           | undefined;
         if (lastTool && !lastTool.result) lastTool.result = result;
       }
     } else if (e.kind === "error") {
       const msg =
         getStr(e.payload, "message", "error") ?? asString(e.payload);
-      msgs.push({ kind: "error", content: msg });
+      items.push({ kind: "error", content: msg });
+    } else if (e.kind === "init" || e.kind === "status" || e.kind === "result") {
+      const summary = (() => {
+        if (e.kind === "status") {
+          return getStr(e.payload, "status") ?? "status";
+        }
+        if (e.kind === "init") {
+          return `session ${getStr(e.payload, "session_id")?.slice(0, 8) ?? "?"} · ${getStr(e.payload, "model") ?? "model?"}`;
+        }
+        if (e.kind === "result") {
+          const stats = getObj(e.payload, "stats");
+          const tokens =
+            stats && typeof stats.total_tokens === "number"
+              ? `${stats.total_tokens} tokens`
+              : null;
+          return tokens ? `result · ${tokens}` : "result";
+        }
+        return "";
+      })();
+      items.push({ kind: "event", eventKind: e.kind, summary });
     }
   }
 
   if (runFinished) {
-    const last = msgs[msgs.length - 1];
+    const last = items[items.length - 1];
     if (last && last.kind === "assistant") last.streaming = false;
   }
 
-  return msgs;
+  return items;
 }
 
 function deriveTodos(events: Event[]): Todo[] {
@@ -213,9 +256,13 @@ export default function Home() {
   const [activeRun, setActiveRun] = useState<Run | null>(null);
   const [events, setEvents] = useState<Event[]>([]);
   const [busy, setBusy] = useState(false);
-  const [showRaw, setShowRaw] = useState(false);
+  const [rightTab, setRightTab] = useState<RightTab>("details");
+  const [expandedEvent, setExpandedEvent] = useState<number | null>(null);
+  const [sidebarWidth, setSidebarWidth] = useState<number>(280);
+  const [hydrated, setHydrated] = useState(false);
   const esRef = useRef<EventSource | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<{ startX: number; startW: number } | null>(null);
 
   const refreshRuns = useCallback(async () => {
     try {
@@ -233,7 +280,27 @@ export default function Home() {
 
   useEffect(() => {
     void refreshRuns();
+    const t = setInterval(() => void refreshRuns(), 4000);
+    return () => clearInterval(t);
   }, [refreshRuns]);
+
+  useEffect(() => {
+    if (!activeRunId) return;
+    const isTerminal =
+      activeRun?.status === "succeeded" ||
+      activeRun?.status === "failed" ||
+      activeRun?.status === "cancelled";
+    if (isTerminal) return;
+    const t = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/runs/${activeRunId}`, { cache: "no-store" });
+        if (r.ok) setActiveRun((await r.json()) as Run);
+      } catch {
+        // ignore
+      }
+    }, 4000);
+    return () => clearInterval(t);
+  }, [activeRunId, activeRun?.status]);
 
   useEffect(() => {
     const el = chatScrollRef.current;
@@ -245,42 +312,8 @@ export default function Home() {
     esRef.current = null;
   }, []);
 
-  const loadRun = useCallback(
-    async (id: string) => {
-      closeStream();
-      setBusy(false);
-      setActiveRunId(id);
-      setEvents([]);
-      try {
-        const [runRes, evRes] = await Promise.all([
-          fetch(`/api/runs/${id}`, { cache: "no-store" }),
-          fetch(`/api/runs/${id}/events.json`, { cache: "no-store" }),
-        ]);
-        if (runRes.ok) setActiveRun((await runRes.json()) as Run);
-        if (evRes.ok) setEvents((await evRes.json()) as Event[]);
-      } catch {
-        // ignore
-      }
-    },
-    [closeStream]
-  );
-
-  const submit = useCallback(async () => {
-    const p = prompt.trim();
-    if (!p || busy) return;
-    setBusy(true);
-    setEvents([]);
-    setActiveRun(null);
-    try {
-      const res = await fetch("/api/tasks", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ prompt: p }),
-      });
-      const { run_id } = (await res.json()) as { run_id: string };
-      setActiveRunId(run_id);
-      void refreshRuns();
-
+  const attachStream = useCallback(
+    (run_id: string) => {
       closeStream();
       const es = new EventSource(`/api/runs/${run_id}/events`);
       esRef.current = es;
@@ -301,7 +334,7 @@ export default function Home() {
             );
           }
         } catch {
-          // ignore parse errors
+          // ignore
         }
       };
       EVENT_KINDS.forEach((k) =>
@@ -309,12 +342,149 @@ export default function Home() {
       );
       es.onerror = () => {
         es.close();
-        setBusy(false);
       };
+    },
+    [closeStream, refreshRuns]
+  );
+
+  const loadRun = useCallback(
+    async (id: string) => {
+      closeStream();
+      setBusy(false);
+      setActiveRunId(id);
+      setEvents([]);
+      setExpandedEvent(null);
+      try {
+        const [runRes, evRes] = await Promise.all([
+          fetch(`/api/runs/${id}`, { cache: "no-store" }),
+          fetch(`/api/runs/${id}/events.json`, { cache: "no-store" }),
+        ]);
+        let run: Run | null = null;
+        if (runRes.ok) {
+          run = (await runRes.json()) as Run;
+          setActiveRun(run);
+        } else if (runRes.status === 404) {
+          if (typeof window !== "undefined")
+            window.localStorage.removeItem(STORAGE_KEY_RUN);
+          setActiveRunId(null);
+          setActiveRun(null);
+          return;
+        }
+        if (evRes.ok) setEvents((await evRes.json()) as Event[]);
+
+        const isTerminal =
+          run?.status === "succeeded" ||
+          run?.status === "failed" ||
+          run?.status === "cancelled";
+        if (run && !isTerminal) {
+          setBusy(true);
+          attachStream(id);
+        }
+      } catch {
+        // ignore
+      }
+    },
+    [closeStream, attachStream]
+  );
+
+  // Restore activeRunId + sidebar width from localStorage on first mount
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const savedRun = window.localStorage.getItem(STORAGE_KEY_RUN);
+    const savedW = window.localStorage.getItem(STORAGE_KEY_SIDEBAR);
+    if (savedW) {
+      const n = parseInt(savedW, 10);
+      if (!Number.isNaN(n) && n >= 180 && n <= 600) setSidebarWidth(n);
+    }
+    setHydrated(true);
+    if (savedRun) void loadRun(savedRun);
+    // run only on first mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist activeRunId
+  useEffect(() => {
+    if (!hydrated || typeof window === "undefined") return;
+    if (activeRunId) {
+      window.localStorage.setItem(STORAGE_KEY_RUN, activeRunId);
+    } else {
+      window.localStorage.removeItem(STORAGE_KEY_RUN);
+    }
+  }, [activeRunId, hydrated]);
+
+  // Persist sidebar width
+  useEffect(() => {
+    if (!hydrated || typeof window === "undefined") return;
+    window.localStorage.setItem(STORAGE_KEY_SIDEBAR, String(sidebarWidth));
+  }, [sidebarWidth, hydrated]);
+
+  const newChat = useCallback(() => {
+    closeStream();
+    setBusy(false);
+    setActiveRunId(null);
+    setActiveRun(null);
+    setEvents([]);
+    setExpandedEvent(null);
+    setPrompt("");
+    if (typeof window !== "undefined")
+      window.localStorage.removeItem(STORAGE_KEY_RUN);
+  }, [closeStream]);
+
+  const submit = useCallback(async () => {
+    const p = prompt.trim();
+    if (!p || busy) return;
+    setBusy(true);
+    setEvents([]);
+    setActiveRun(null);
+    setExpandedEvent(null);
+    setPrompt("");
+    try {
+      const res = await fetch("/api/tasks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt: p }),
+      });
+      const { run_id } = (await res.json()) as { run_id: string };
+      setActiveRunId(run_id);
+      void refreshRuns();
+      attachStream(run_id);
     } catch {
       setBusy(false);
     }
-  }, [prompt, busy, closeStream, refreshRuns]);
+  }, [prompt, busy, refreshRuns, attachStream]);
+
+  // Sidebar drag-resize
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!dragRef.current) return;
+      const dx = e.clientX - dragRef.current.startX;
+      const next = Math.min(
+        600,
+        Math.max(180, dragRef.current.startW + dx)
+      );
+      setSidebarWidth(next);
+    };
+    const onUp = () => {
+      dragRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  const startDrag = useCallback(
+    (e: React.MouseEvent) => {
+      dragRef.current = { startX: e.clientX, startW: sidebarWidth };
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [sidebarWidth]
+  );
 
   const runFinished = useMemo(() => {
     const s = activeRun?.status;
@@ -329,28 +499,45 @@ export default function Home() {
   const stats = useMemo(() => deriveStats(events), [events]);
 
   return (
-    <main className="grid grid-cols-12 gap-3 p-3 h-screen max-h-screen overflow-hidden">
-      <aside className="col-span-3 bg-neutral-900 border border-neutral-800 rounded-lg flex flex-col overflow-hidden">
-        <div className="p-3 border-b border-neutral-800 flex items-center justify-between">
-          <div>
+    <main className="flex gap-3 p-3 h-screen max-h-screen overflow-hidden">
+      <aside
+        className="bg-neutral-900 border border-neutral-800 rounded-lg flex flex-col overflow-hidden shrink-0"
+        style={{ width: sidebarWidth }}
+      >
+        <div className="p-3 border-b border-neutral-800 flex items-center justify-between gap-2">
+          <div className="min-w-0">
             <h1 className="text-lg font-semibold leading-tight">asor</h1>
-            <p className="text-[10px] text-neutral-500 uppercase tracking-wide">
+            <p className="text-[10px] text-neutral-500 uppercase tracking-wide truncate">
               Gemini CLI orchestrator
             </p>
           </div>
-          <button
-            onClick={() => void refreshRuns()}
-            className="text-[11px] text-neutral-400 hover:text-neutral-100"
-          >
-            ↻ refresh
-          </button>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              onClick={newChat}
+              className="text-[11px] px-2 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white font-medium"
+              title="Start a new chat"
+            >
+              + New
+            </button>
+            <button
+              onClick={() => void refreshRuns()}
+              className="text-[11px] px-2 py-1 rounded-md border border-neutral-700 text-neutral-400 hover:text-neutral-100 hover:border-neutral-600"
+              title="Auto-refreshing every 4s"
+            >
+              Refresh
+            </button>
+          </div>
         </div>
-        <div className="p-3">
-          <h2 className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500 mb-2">
+        <div className="px-3 pt-3 flex items-center gap-2">
+          <h2 className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">
             Runs ({runs.length})
           </h2>
+          <span className="inline-flex items-center gap-1 text-[9px] text-neutral-600">
+            <span className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse" />
+            live
+          </span>
         </div>
-        <ul className="flex-1 overflow-y-auto px-2 pb-2 space-y-1">
+        <ul className="flex-1 overflow-y-auto p-2 space-y-1">
           {runs.length === 0 && (
             <li className="text-[11px] text-neutral-500 px-2">no runs yet</li>
           )}
@@ -382,37 +569,13 @@ export default function Home() {
         </ul>
       </aside>
 
-      <section className="col-span-6 flex flex-col gap-3 overflow-hidden">
-        <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3">
-          <textarea
-            className="w-full h-20 rounded-md bg-neutral-950 border border-neutral-800 p-2 text-sm focus:outline-none focus:border-indigo-500 resize-none"
-            placeholder="Describe a task — ⌘/Ctrl + Enter to submit"
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            disabled={busy}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                e.preventDefault();
-                void submit();
-              }
-            }}
-          />
-          <div className="flex items-center gap-3 mt-2">
-            <button
-              onClick={() => void submit()}
-              disabled={busy || !prompt.trim()}
-              className="px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-sm font-medium"
-            >
-              {busy ? "Running…" : "Run"}
-            </button>
-            {activeRunId && (
-              <span className="text-[11px] text-neutral-500 font-mono">
-                run {activeRunId.slice(0, 8)} · {activeRun?.status ?? "—"}
-              </span>
-            )}
-          </div>
-        </div>
+      <div
+        onMouseDown={startDrag}
+        className="w-1 hover:bg-indigo-600/60 active:bg-indigo-500 cursor-col-resize rounded transition-colors shrink-0"
+        title="Drag to resize"
+      />
 
+      <section className="flex-1 flex flex-col gap-3 overflow-hidden min-w-0">
         <div
           ref={chatScrollRef}
           className="flex-1 bg-neutral-900 border border-neutral-800 rounded-lg p-4 overflow-y-auto"
@@ -420,150 +583,346 @@ export default function Home() {
           {chat.length === 0 ? (
             <div className="flex h-full items-center justify-center">
               <p className="text-xs text-neutral-500">
-                Submit a prompt or pick a past run.
+                Submit a prompt below to start a run.
               </p>
             </div>
           ) : (
             <div className="space-y-3">
               {chat.map((m, i) => (
-                <ChatBubble key={i} msg={m} />
+                <ChatBubble key={i} item={m} />
               ))}
               {busy &&
                 chat[chat.length - 1]?.kind !== "assistant" && <TypingDots />}
             </div>
           )}
         </div>
+
+        <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-2 shadow-lg">
+          <div className="flex items-end gap-2">
+            <textarea
+              className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 resize-none min-h-[44px] max-h-40"
+              placeholder="Message asor — Enter to send, Shift+Enter for newline"
+              rows={1}
+              value={prompt}
+              onChange={(e) => {
+                setPrompt(e.target.value);
+                e.currentTarget.style.height = "auto";
+                e.currentTarget.style.height =
+                  Math.min(e.currentTarget.scrollHeight, 160) + "px";
+              }}
+              disabled={busy}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void submit();
+                }
+              }}
+            />
+            <button
+              onClick={() => void submit()}
+              disabled={busy || !prompt.trim()}
+              className="h-11 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-sm font-medium transition-colors"
+            >
+              {busy ? "..." : "Send"}
+            </button>
+          </div>
+          {activeRunId && (
+            <div className="px-3 pt-1.5 text-[10px] text-neutral-500 font-mono">
+              run {activeRunId.slice(0, 8)} · {activeRun?.status ?? "—"}
+              {busy && (
+                <span className="ml-2 inline-flex items-center gap-1 text-emerald-500">
+                  <span className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse" />
+                  streaming
+                </span>
+              )}
+            </div>
+          )}
+        </div>
       </section>
 
-      <aside className="col-span-3 flex flex-col gap-3 overflow-hidden">
-        <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3">
-          <h2 className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500 mb-2">
-            Run details
-          </h2>
-          <Stat
-            label="Status"
-            value={stats.status ?? activeRun?.status ?? "—"}
-          />
-          <Stat
-            label="Model"
-            value={stats.model ?? activeRun?.invocation?.model ?? "—"}
-            mono
-          />
-          <Stat
-            label="Session"
-            value={stats.sessionId?.slice(0, 8) ?? "—"}
-            mono
-          />
-          <Stat
-            label="Tokens"
-            value={
-              stats.totalTokens != null
-                ? `${stats.totalTokens} (in ${stats.inputTokens ?? "?"}, out ${
-                    stats.outputTokens ?? "?"
-                  })`
-                : "—"
-            }
-          />
-          <Stat
-            label="Duration"
-            value={
-              stats.durationMs != null
-                ? `${(stats.durationMs / 1000).toFixed(1)}s`
-                : "—"
-            }
-          />
-          <Stat label="Tool calls" value={stats.toolCalls ?? 0} />
-          <Stat
-            label="Exit code"
-            value={stats.exitCode == null ? "—" : stats.exitCode}
-          />
-        </div>
-
-        <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 overflow-y-auto">
-          <h2 className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500 mb-2">
-            Agent todos {todos.length > 0 && `(${todos.length})`}
-          </h2>
-          {todos.length === 0 ? (
-            <p className="text-[11px] text-neutral-500">
-              The agent hasn&apos;t planned any sub-tasks yet.
-            </p>
-          ) : (
-            <ul className="space-y-1.5">
-              {todos.map((t, i) => (
-                <li key={i} className="flex items-start gap-2 text-[12px]">
-                  <TodoIcon status={t.status} />
-                  <span
-                    className={
-                      t.status === "completed"
-                        ? "line-through text-neutral-500"
-                        : "text-neutral-200"
-                    }
-                  >
-                    {t.content}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 overflow-y-auto flex-1 min-h-0">
-          <button
-            onClick={() => setShowRaw((s) => !s)}
-            className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500 mb-2 flex items-center gap-1.5 hover:text-neutral-300"
+      <aside className="w-80 bg-neutral-900 border border-neutral-800 rounded-lg flex flex-col overflow-hidden shrink-0">
+        <div className="flex border-b border-neutral-800">
+          <TabButton
+            active={rightTab === "details"}
+            onClick={() => setRightTab("details")}
           >
-            {showRaw ? "▼" : "▶"} Raw events ({events.length})
-          </button>
-          {showRaw && (
-            <ol className="space-y-1 text-[10px] font-mono">
-              {events.map((e, i) => (
-                <li
-                  key={i}
-                  className="border border-neutral-800 rounded px-1.5 py-1 bg-neutral-950"
-                >
-                  <span className="text-indigo-400">{e.kind}</span>{" "}
-                  <span className="text-neutral-400 break-all">
-                    {asString(e.payload).slice(0, 140)}
-                  </span>
-                </li>
-              ))}
-            </ol>
-          )}
+            Details
+          </TabButton>
+          <TabButton
+            active={rightTab === "events"}
+            onClick={() => setRightTab("events")}
+          >
+            Events
+            <span className="ml-1.5 text-[9px] text-neutral-500">
+              {events.length}
+            </span>
+          </TabButton>
         </div>
+
+        {rightTab === "details" && (
+          <div className="flex-1 overflow-y-auto p-3 space-y-4">
+            <section>
+              <h3 className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500 mb-2">
+                Run
+              </h3>
+              <Stat
+                label="Status"
+                value={stats.status ?? activeRun?.status ?? "—"}
+              />
+              <Stat
+                label="Model"
+                value={stats.model ?? activeRun?.invocation?.model ?? "—"}
+                mono
+              />
+              <Stat
+                label="Session"
+                value={stats.sessionId?.slice(0, 8) ?? "—"}
+                mono
+              />
+              <Stat
+                label="Tokens"
+                value={
+                  stats.totalTokens != null
+                    ? `${stats.totalTokens} (in ${stats.inputTokens ?? "?"}, out ${
+                        stats.outputTokens ?? "?"
+                      })`
+                    : "—"
+                }
+              />
+              <Stat
+                label="Duration"
+                value={
+                  stats.durationMs != null
+                    ? `${(stats.durationMs / 1000).toFixed(1)}s`
+                    : "—"
+                }
+              />
+              <Stat label="Tool calls" value={stats.toolCalls ?? 0} />
+              <Stat
+                label="Exit code"
+                value={stats.exitCode == null ? "—" : stats.exitCode}
+              />
+            </section>
+
+            <section>
+              <h3 className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500 mb-2">
+                Agent todos {todos.length > 0 && `(${todos.length})`}
+              </h3>
+              {todos.length === 0 ? (
+                <p className="text-[11px] text-neutral-500">
+                  The agent hasn&apos;t planned any sub-tasks yet.
+                </p>
+              ) : (
+                <ul className="space-y-1.5">
+                  {todos.map((t, i) => (
+                    <li key={i} className="flex items-start gap-2 text-[12px]">
+                      <TodoIcon status={t.status} />
+                      <span
+                        className={
+                          t.status === "completed"
+                            ? "line-through text-neutral-500"
+                            : "text-neutral-200"
+                        }
+                      >
+                        {t.content}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </div>
+        )}
+
+        {rightTab === "events" && (
+          <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
+            {events.length === 0 ? (
+              <p className="text-[11px] text-neutral-500 p-2">
+                No events yet.
+              </p>
+            ) : (
+              events.map((e, i) => {
+                const expanded = expandedEvent === i;
+                const cls =
+                  EVENT_KIND_COLORS[e.kind] ??
+                  "text-neutral-300 border-neutral-700 bg-neutral-900/60";
+                const full = JSON.stringify(e, null, 2);
+                const summary = JSON.stringify(e.payload ?? {});
+                return (
+                  <div
+                    key={i}
+                    className={`rounded-md border ${cls} transition-colors`}
+                  >
+                    <button
+                      onClick={() =>
+                        setExpandedEvent(expanded ? null : i)
+                      }
+                      className="w-full text-left px-2 py-1.5 flex items-center gap-2"
+                    >
+                      <span className="text-[9px] text-neutral-500 font-mono w-6 shrink-0">
+                        #{e.seq}
+                      </span>
+                      <span className="text-[10px] font-semibold uppercase tracking-wider shrink-0">
+                        {e.kind}
+                      </span>
+                      <span className="text-[10px] text-neutral-400 truncate flex-1 font-mono">
+                        {summary.length > 80
+                          ? summary.slice(0, 80) + "…"
+                          : summary}
+                      </span>
+                      <span className="text-[9px] text-neutral-600 shrink-0">
+                        {expanded ? "▼" : "▶"}
+                      </span>
+                    </button>
+                    {expanded && (
+                      <pre className="px-2 pb-2 text-[10px] font-mono text-neutral-300 whitespace-pre-wrap break-all border-t border-neutral-800/60 pt-2">
+                        {full}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
       </aside>
     </main>
   );
 }
 
-function ChatBubble({ msg }: { msg: ChatMsg }) {
-  if (msg.kind === "user") {
+function TabButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex-1 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider transition-colors ${
+        active
+          ? "text-neutral-100 border-b-2 border-indigo-500 bg-neutral-900"
+          : "text-neutral-500 hover:text-neutral-300 border-b-2 border-transparent"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Markdown({ children }: { children: string }) {
+  return (
+    <div className="markdown-body text-sm leading-relaxed">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => (
+            <p className="mb-2 last:mb-0 whitespace-pre-wrap">{children}</p>
+          ),
+          h1: ({ children }) => (
+            <h1 className="text-lg font-bold mt-3 mb-2">{children}</h1>
+          ),
+          h2: ({ children }) => (
+            <h2 className="text-base font-bold mt-3 mb-2">{children}</h2>
+          ),
+          h3: ({ children }) => (
+            <h3 className="text-sm font-bold mt-2 mb-1">{children}</h3>
+          ),
+          ul: ({ children }) => (
+            <ul className="list-disc ml-5 mb-2 space-y-0.5">{children}</ul>
+          ),
+          ol: ({ children }) => (
+            <ol className="list-decimal ml-5 mb-2 space-y-0.5">{children}</ol>
+          ),
+          li: ({ children }) => <li className="text-sm">{children}</li>,
+          code: ({ className, children }) => {
+            const isBlock = (className ?? "").includes("language-");
+            if (isBlock) {
+              return <code className="block">{children}</code>;
+            }
+            return (
+              <code className="px-1 py-0.5 rounded bg-neutral-950 border border-neutral-800 text-[12px] font-mono text-amber-200">
+                {children}
+              </code>
+            );
+          },
+          pre: ({ children }) => (
+            <pre className="bg-neutral-950 border border-neutral-800 rounded-md p-2 my-2 overflow-x-auto text-[12px] font-mono text-neutral-200">
+              {children}
+            </pre>
+          ),
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="text-indigo-400 underline hover:text-indigo-300"
+            >
+              {children}
+            </a>
+          ),
+          blockquote: ({ children }) => (
+            <blockquote className="border-l-2 border-neutral-700 pl-3 text-neutral-400 italic my-2">
+              {children}
+            </blockquote>
+          ),
+          table: ({ children }) => (
+            <div className="overflow-x-auto my-2">
+              <table className="text-[12px] border-collapse">{children}</table>
+            </div>
+          ),
+          th: ({ children }) => (
+            <th className="border border-neutral-700 px-2 py-1 bg-neutral-950 text-left">
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td className="border border-neutral-800 px-2 py-1">{children}</td>
+          ),
+          hr: () => <hr className="border-neutral-800 my-3" />,
+          strong: ({ children }) => (
+            <strong className="font-semibold text-neutral-100">{children}</strong>
+          ),
+        }}
+      >
+        {children}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function ChatBubble({ item }: { item: ChatItem }) {
+  if (item.kind === "user") {
     return (
       <div className="flex justify-end">
         <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-indigo-600 px-3 py-2 text-sm whitespace-pre-wrap">
-          {msg.content}
+          {item.content}
         </div>
       </div>
     );
   }
-  if (msg.kind === "tool") {
+  if (item.kind === "tool") {
     return (
       <div className="flex justify-start">
         <div className="max-w-[90%] rounded-md border border-amber-900/60 bg-amber-950/30 px-3 py-2">
           <div className="text-[10px] uppercase tracking-wider text-amber-500/80 mb-1 font-semibold">
-            tool call · {msg.toolName}
+            tool call · {item.toolName}
           </div>
           <pre className="text-[11px] text-amber-100/80 whitespace-pre-wrap font-mono leading-snug">
-            {msg.args.length > 600 ? msg.args.slice(0, 600) + "…" : msg.args}
+            {item.args.length > 600 ? item.args.slice(0, 600) + "…" : item.args}
           </pre>
-          {msg.result && (
+          {item.result && (
             <>
               <div className="text-[10px] uppercase tracking-wider text-emerald-500/80 mt-2 mb-1 font-semibold">
                 result
               </div>
               <pre className="text-[11px] text-emerald-100/70 whitespace-pre-wrap font-mono leading-snug">
-                {msg.result.length > 600
-                  ? msg.result.slice(0, 600) + "…"
-                  : msg.result}
+                {item.result.length > 600
+                  ? item.result.slice(0, 600) + "…"
+                  : item.result}
               </pre>
             </>
           )}
@@ -571,20 +930,37 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
       </div>
     );
   }
-  if (msg.kind === "error") {
+  if (item.kind === "error") {
     return (
       <div className="flex justify-start">
         <div className="max-w-[85%] rounded-md border border-red-900/60 bg-red-950/30 px-3 py-2 text-[12px] text-red-200 whitespace-pre-wrap">
-          {msg.content}
+          {item.content}
+        </div>
+      </div>
+    );
+  }
+  if (item.kind === "event") {
+    const color =
+      item.eventKind === "status"
+        ? "text-indigo-400 border-indigo-900/50"
+        : item.eventKind === "init"
+          ? "text-sky-400 border-sky-900/50"
+          : "text-violet-400 border-violet-900/50";
+    return (
+      <div className="flex justify-center">
+        <div
+          className={`text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full border bg-neutral-950 ${color}`}
+        >
+          {item.eventKind} · {item.summary}
         </div>
       </div>
     );
   }
   return (
     <div className="flex justify-start">
-      <div className="max-w-[85%] rounded-2xl rounded-tl-sm bg-neutral-800 px-3 py-2 text-sm whitespace-pre-wrap">
-        {msg.content}
-        {msg.streaming && (
+      <div className="max-w-[90%] rounded-2xl rounded-tl-sm bg-neutral-800 px-3 py-2 text-neutral-100">
+        <Markdown>{item.content}</Markdown>
+        {item.streaming && (
           <span className="inline-block w-1.5 h-3.5 bg-neutral-300 ml-1 align-middle animate-pulse" />
         )}
       </div>
