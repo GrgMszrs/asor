@@ -49,8 +49,10 @@ class AgentInvocation(BaseModel):
 class Run(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     task_id: UUID
+    parent_run_id: UUID | None = None
     status: RunStatus = RunStatus.pending
     invocation: AgentInvocation = Field(default_factory=AgentInvocation)
+    session_id: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     final_text: str | None = None

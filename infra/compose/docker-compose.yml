@@ -31,12 +31,20 @@ services:
       context: ../..
       dockerfile: infra/docker/api.Dockerfile
     env_file:
-      - ../../.env
+      - path: ../../.env
+        required: false
     environment:
       ASOR_API_BASE_URL: http://api:8000
-      ASOR_AGENT_RUNNER_IMAGE: asor-agent-runner:dev
-      ASOR_RUNNER_NETWORK: asor_default
+      ASOR_AGENT_RUNNER_IMAGE: ${ASOR_AGENT_RUNNER_IMAGE:-asor-agent-runner:dev}
+      ASOR_RUNNER_NETWORK: ${ASOR_RUNNER_NETWORK:-asor_default}
+      ASOR_RUNNER_TIMEOUT_SECONDS: ${ASOR_RUNNER_TIMEOUT_SECONDS:-180}
+      ASOR_GEMINI_HOME_VOLUME: ${ASOR_GEMINI_HOME_VOLUME:-asor-gemini-home}
       DATABASE_URL: postgresql+psycopg://asor:asor@postgres:5432/asor
+      GOOGLE_GENAI_USE_VERTEXAI: ${GOOGLE_GENAI_USE_VERTEXAI:-true}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-global}
+      GEMINI_MODEL: ${GEMINI_MODEL:-flash}
+      ASOR_GCLOUD_ADC_PATH: ${ASOR_GCLOUD_ADC_PATH:-}
     ports:
       - "8000:8000"
     volumes:

@@ -25,8 +25,13 @@ from __future__ import annotations
 
 import json
 import os
+import pty
+import queue
+import shutil
 import subprocess
 import sys
+import threading
+import time
 from datetime import UTC, datetime
 
 import httpx
@@ -61,6 +66,34 @@ def _post_event(
         print(f"[asor-runner] callback failed seq={seq}: {exc}", file=sys.stderr)
 
 
+def _reader_fd(fd: int, lines: queue.Queue[str]) -> None:
+    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as pipe:
+        for line in pipe:
+            lines.put(line)
+
+
+def _ensure_checkpointing_enabled() -> bool:
+    gemini_dir = os.path.expanduser("~/.gemini")
+    settings_path = os.path.join(gemini_dir, "settings.json")
+    os.makedirs(gemini_dir, exist_ok=True)
+    settings: dict = {}
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    settings = loaded
+        except (OSError, json.JSONDecodeError):
+            settings = {}
+    general = settings.setdefault("general", {})
+    checkpointing = general.setdefault("checkpointing", {})
+    enabled = shutil.which("git") is not None
+    checkpointing["enabled"] = enabled
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+    return enabled
+
+
 def main() -> int:
     run_id = _env("ASOR_RUN_ID")
     prompt = _env("ASOR_PROMPT")
@@ -72,6 +105,9 @@ def main() -> int:
     if model == "auto":
         model = "flash"
     extensions = _env("ASOR_EXTENSIONS", required=False, default="")
+    timeout_seconds = int(_env("ASOR_RUNNER_TIMEOUT_SECONDS", required=False, default="180"))
+    resume_session_id = _env("ASOR_RESUME_SESSION_ID", required=False, default="")
+    checkpointing_enabled = _ensure_checkpointing_enabled()
 
     # Sanity-check Vertex/ADC auth so we fail loudly with a clear status event
     # instead of letting Gemini CLI bail with a cryptic prompt.
@@ -92,42 +128,84 @@ def main() -> int:
         "-oL",
         "-eL",
         "gemini",
-        "-p",
-        prompt,
-        "--output-format",
-        "stream-json",
-        "--approval-mode",
-        "yolo",
-        "--skip-trust",
-        "--model",
-        model,
     ]
+    if resume_session_id:
+        cmd.extend(["--resume", resume_session_id])
+    cmd.extend(
+        [
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--approval-mode",
+            "yolo",
+            "--skip-trust",
+            "--model",
+            model,
+        ]
+    )
     if extensions:
         cmd.extend(["--extensions", extensions])
 
     print(f"[asor-runner] launching: {' '.join(cmd[:6])} ...", file=sys.stderr)
 
-    seq = 0
+    seq = 1
     with httpx.Client() as client:
         _post_event(
             client,
             callback_url,
             run_id,
             seq,
-            {"type": "status", "status": "started", "model": model},
+            {
+                "type": "status",
+                "status": "started",
+                "model": model,
+                "resumed_session_id": resume_session_id or None,
+                "checkpointing_enabled": checkpointing_enabled,
+            },
         )
         seq += 1
 
+        master_fd, slave_fd = pty.openpty()
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=slave_fd,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
-        assert proc.stdout is not None
+        os.close(slave_fd)
+        lines: queue.Queue[str] = queue.Queue()
+        reader = threading.Thread(target=_reader_fd, args=(master_fd, lines), daemon=True)
+        reader.start()
+        deadline = time.monotonic() + timeout_seconds
 
-        for line in proc.stdout:
+        while True:
+            if proc.poll() is not None and lines.empty():
+                break
+            if time.monotonic() > deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                stderr_tail = (proc.stderr.read() if proc.stderr else "")[-2000:]
+                timeout_status = {
+                    "type": "status",
+                    "status": "failed",
+                    "exit_code": proc.returncode,
+                    "stderr_tail": (
+                        f"Gemini CLI timed out after {timeout_seconds}s without completing.\n"
+                        + stderr_tail
+                    )[-2000:],
+                }
+                _post_event(client, callback_url, run_id, seq, timeout_status)
+                return 1
+            try:
+                line = lines.get(timeout=1)
+            except queue.Empty:
+                continue
             line = line.strip()
             if not line:
                 continue
