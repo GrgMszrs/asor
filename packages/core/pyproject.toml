@@ -1,6 +1,6 @@
 [project]
 name = "asor-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "asor domain models and runner interface"
 requires-python = ">=3.11"
 dependencies = [

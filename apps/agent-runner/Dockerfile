@@ -11,7 +11,7 @@ WORKDIR /workspace
 COPY entrypoint.py /usr/local/bin/asor-runner
 RUN chmod +x /usr/local/bin/asor-runner \
     && python3 -m venv /opt/runner-venv \
-    && /opt/runner-venv/bin/pip install --no-cache-dir httpx==0.27.*
+    && /opt/runner-venv/bin/pip install --no-cache-dir pika==1.3.*
 
 ENV PATH="/opt/runner-venv/bin:${PATH}"
 

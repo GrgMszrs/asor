@@ -1,13 +1,13 @@
 [project]
 name = "asor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-agent orchestrator built on Gemini CLI"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
 [tool.uv.workspace]
-members = ["apps/api", "packages/core"]
+members = ["apps/api", "apps/worker", "packages/core"]
 
 [tool.uv.sources]
 asor-core = { workspace = true }

@@ -8,14 +8,22 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from uuid import UUID
 
-from asor_core import AgentInvocation, Run, RunStatus, Task, TraceEvent, TraceEventKind
+from asor_core import (
+    AgentInvocation,
+    Run,
+    RunStatus,
+    Task,
+    TaskDispatch,
+    TraceEvent,
+    TraceEventKind,
+)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from asor_api.amqp import AmqpClient
 from asor_api.config import Settings
-from asor_api.runner_docker import DockerAgentRunner
 from asor_api.store import Store, create_store
 
 log = logging.getLogger(__name__)
@@ -35,16 +43,61 @@ class CreateTaskResponse(BaseModel):
 
 def create_app() -> FastAPI:
     settings = Settings()
-    runner = DockerAgentRunner(settings)
     store = create_store(settings.database_url)
+    amqp = AmqpClient(settings.asor_amqp_url)
+
+    async def _handle_event_message(body: bytes) -> None:
+        event = TraceEvent.model_validate_json(body)
+        await store.append_event(event)
+        run_id = event.run_id
+
+        if event.kind is TraceEventKind.status:
+            status = event.payload.get("status")
+            run = await store.get_run(run_id)
+            if run is not None:
+                if status == "succeeded":
+                    run.status = RunStatus.succeeded
+                    run.finished_at = datetime.now(UTC)
+                elif status == "failed":
+                    run.status = RunStatus.failed
+                    run.finished_at = datetime.now(UTC)
+                    run.error = event.payload.get("stderr_tail")
+                await store.update_run(run)
+        elif event.kind is TraceEventKind.init:
+            session_id = event.payload.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                run = await store.get_run(run_id)
+                if run is not None:
+                    run.session_id = session_id
+                    await store.update_run(run)
+        elif event.kind is TraceEventKind.result:
+            run = await store.get_run(run_id)
+            if run is not None:
+                run.final_text = event.payload.get("response") or run.final_text
+                await store.update_run(run)
+        elif event.kind is TraceEventKind.message and event.payload.get("role") == "assistant":
+            content = event.payload.get("content")
+            if isinstance(content, str) and content:
+                run = await store.get_run(run_id)
+                if run is not None:
+                    if event.payload.get("delta") is True:
+                        run.final_text = (run.final_text or "") + content
+                    else:
+                        run.final_text = content
+                    await store.update_run(run)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await store.init()
         app.state.store = store
-        yield
+        await amqp.connect()
+        await amqp.consume_events(_handle_event_message)
+        try:
+            yield
+        finally:
+            await amqp.close()
 
-    app = FastAPI(title="asor", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="asor", version="0.2.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -98,49 +151,8 @@ def create_app() -> FastAPI:
                 payload={"role": "user", "content": task.prompt, "source": "asor"},
             )
         )
-        runner.launch(task, run)
+        await amqp.publish_task(TaskDispatch(task=task, run=run))
         return CreateTaskResponse(task_id=task.id, run_id=run.id)
-
-    @app.post("/runs/{run_id}/events", status_code=204)
-    async def ingest_event(run_id: UUID, event: TraceEvent) -> None:
-        if event.run_id != run_id:
-            raise HTTPException(400, "run_id mismatch")
-        await app_store().append_event(event)
-
-        if event.kind is TraceEventKind.status:
-            status = event.payload.get("status")
-            run = await app_store().get_run(run_id)
-            if run is not None:
-                if status == "succeeded":
-                    run.status = RunStatus.succeeded
-                    run.finished_at = datetime.now(UTC)
-                elif status == "failed":
-                    run.status = RunStatus.failed
-                    run.finished_at = datetime.now(UTC)
-                    run.error = event.payload.get("stderr_tail")
-                await app_store().update_run(run)
-        elif event.kind is TraceEventKind.init:
-            session_id = event.payload.get("session_id")
-            if isinstance(session_id, str) and session_id:
-                run = await app_store().get_run(run_id)
-                if run is not None:
-                    run.session_id = session_id
-                    await app_store().update_run(run)
-        elif event.kind is TraceEventKind.result:
-            run = await app_store().get_run(run_id)
-            if run is not None:
-                run.final_text = event.payload.get("response") or run.final_text
-                await app_store().update_run(run)
-        elif event.kind is TraceEventKind.message and event.payload.get("role") == "assistant":
-            content = event.payload.get("content")
-            if isinstance(content, str) and content:
-                run = await app_store().get_run(run_id)
-                if run is not None:
-                    if event.payload.get("delta") is True:
-                        run.final_text = (run.final_text or "") + content
-                    else:
-                        run.final_text = content
-                    await app_store().update_run(run)
 
     @app.get("/runs", response_model=list[Run])
     async def list_runs() -> list[Run]:

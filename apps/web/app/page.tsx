@@ -287,6 +287,7 @@ export default function Home() {
   const [expandedEvent, setExpandedEvent] = useState<number | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState<number>(280);
   const [hydrated, setHydrated] = useState(false);
+  const [viewTab, setViewTab] = useState<"chat" | "queues">("chat");
   const esRef = useRef<EventSource | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ startX: number; startW: number } | null>(null);
@@ -540,7 +541,55 @@ export default function Home() {
   const stats = useMemo(() => deriveStats(events), [events]);
 
   return (
-    <main className="flex gap-3 p-3 h-screen max-h-screen overflow-hidden">
+    <div className="flex flex-col h-screen max-h-screen overflow-hidden">
+      <nav className="flex items-center gap-1 px-3 py-2 border-b border-neutral-800 bg-neutral-950 shrink-0">
+        <button
+          onClick={() => setViewTab("chat")}
+          className={`text-[11px] px-3 py-1.5 rounded-md font-medium transition-colors ${
+            viewTab === "chat"
+              ? "bg-indigo-600 text-white"
+              : "text-neutral-400 hover:text-neutral-100 hover:bg-neutral-900"
+          }`}
+        >
+          Chat
+        </button>
+        <button
+          onClick={() => setViewTab("queues")}
+          className={`text-[11px] px-3 py-1.5 rounded-md font-medium transition-colors ${
+            viewTab === "queues"
+              ? "bg-indigo-600 text-white"
+              : "text-neutral-400 hover:text-neutral-100 hover:bg-neutral-900"
+          }`}
+        >
+          Queues
+        </button>
+        <span className="ml-auto text-[10px] text-neutral-600 font-mono">v0.2</span>
+      </nav>
+      {viewTab === "queues" && (
+        <section className="flex flex-col flex-1 min-h-0 bg-neutral-950">
+          <div className="px-3 py-2 text-[11px] text-neutral-500 border-b border-neutral-800">
+            RabbitMQ Management — default credentials{" "}
+            <span className="font-mono text-neutral-300">asor / asor</span>. Direct link:{" "}
+            <a
+              href="http://localhost:15672"
+              target="_blank"
+              rel="noreferrer"
+              className="text-indigo-400 hover:text-indigo-300 underline"
+            >
+              http://localhost:15672
+            </a>
+          </div>
+          <iframe
+            src="http://localhost:15672"
+            title="RabbitMQ Management"
+            className="flex-1 w-full bg-white border-0"
+          />
+        </section>
+      )}
+      <main
+        className="flex gap-3 p-3 flex-1 min-h-0 overflow-hidden"
+        style={{ display: viewTab === "chat" ? undefined : "none" }}
+      >
       <aside
         className="bg-neutral-900 border border-neutral-800 rounded-lg flex flex-col overflow-hidden shrink-0"
         style={{ width: sidebarWidth }}
@@ -827,7 +876,8 @@ export default function Home() {
           </div>
         )}
       </aside>
-    </main>
+      </main>
+    </div>
   );
 }
 

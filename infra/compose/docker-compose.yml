@@ -17,6 +17,22 @@ services:
       timeout: 3s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: asor
+      RABBITMQ_DEFAULT_PASS: asor
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   agent-runner-build:
     image: asor-agent-runner:dev
     build:
@@ -34,23 +50,39 @@ services:
       - path: ../../.env
         required: false
     environment:
-      ASOR_API_BASE_URL: http://api:8000
+      ASOR_AMQP_URL: amqp://asor:asor@rabbitmq:5672/
+      DATABASE_URL: postgresql+psycopg://asor:asor@postgres:5432/asor
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    image: asor-worker:dev
+    build:
+      context: ../..
+      dockerfile: infra/docker/worker.Dockerfile
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      ASOR_AMQP_URL: amqp://asor:asor@rabbitmq:5672/
       ASOR_AGENT_RUNNER_IMAGE: ${ASOR_AGENT_RUNNER_IMAGE:-asor-agent-runner:dev}
       ASOR_RUNNER_NETWORK: ${ASOR_RUNNER_NETWORK:-asor_default}
       ASOR_RUNNER_TIMEOUT_SECONDS: ${ASOR_RUNNER_TIMEOUT_SECONDS:-180}
       ASOR_GEMINI_HOME_VOLUME: ${ASOR_GEMINI_HOME_VOLUME:-asor-gemini-home}
-      DATABASE_URL: postgresql+psycopg://asor:asor@postgres:5432/asor
       GOOGLE_GENAI_USE_VERTEXAI: ${GOOGLE_GENAI_USE_VERTEXAI:-true}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-global}
       GEMINI_MODEL: ${GEMINI_MODEL:-flash}
       ASOR_GCLOUD_ADC_PATH: ${ASOR_GCLOUD_ADC_PATH:-}
-    ports:
-      - "8000:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
-      postgres:
+      rabbitmq:
         condition: service_healthy
 
   web:
@@ -68,3 +100,4 @@ services:
 
 volumes:
   postgres-data:
+  rabbitmq-data:

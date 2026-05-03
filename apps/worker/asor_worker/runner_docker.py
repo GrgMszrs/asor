@@ -1,7 +1,8 @@
 """DockerAgentRunner: launches the agent-runner image as a container per run.
 
-Auth: passes Vertex/ADC env vars and mounts the host's ADC credentials file
-read-only into the runner container at the standard gcloud path.
+Runs inside the worker. The agent-runner publishes trace events back to
+RabbitMQ; the API consumes them. The worker mounts the host's ADC file
+read-only into each runner container.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import docker
 from asor_core import Run, Task
 from docker.errors import DockerException
 
-from asor_api.config import Settings
+from asor_worker.config import Settings
 
 log = logging.getLogger(__name__)
 
@@ -32,11 +33,10 @@ class DockerAgentRunner:
             return None
 
         s = self._settings
-        callback_url = f"{s.asor_api_base_url}/runs/{run.id}/events"
         env = {
             "ASOR_RUN_ID": str(run.id),
             "ASOR_PROMPT": task.prompt,
-            "ASOR_CALLBACK_URL": callback_url,
+            "ASOR_AMQP_URL": s.asor_amqp_url,
             "ASOR_MODEL": run.invocation.model or s.gemini_model,
             "ASOR_EXTENSIONS": ",".join(run.invocation.extensions),
             "ASOR_RUNNER_TIMEOUT_SECONDS": str(s.asor_runner_timeout_seconds),

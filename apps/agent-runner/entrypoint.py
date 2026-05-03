@@ -2,7 +2,8 @@
 """asor agent-runner entrypoint.
 
 Reads a task spec from env vars, invokes Gemini CLI in headless streaming-JSON mode,
-and POSTs each JSONL event to the orchestrator's callback URL.
+and publishes each JSONL event as a message to RabbitMQ on the `asor.events` topic
+exchange with routing key `run.<run_id>.<kind>`.
 
 Auth: Vertex AI via ADC. The runner expects the host's ADC json mounted at
 GOOGLE_APPLICATION_CREDENTIALS, plus GOOGLE_GENAI_USE_VERTEXAI=true,
@@ -12,9 +13,12 @@ must NOT be set — they take precedence over ADC.
 Env vars:
   ASOR_RUN_ID                    UUID of the run (required)
   ASOR_PROMPT                    Prompt text to feed Gemini CLI (required)
-  ASOR_CALLBACK_URL              URL to POST events to (required)
+  ASOR_AMQP_URL                  AMQP URL, e.g. amqp://asor:asor@rabbitmq:5672/ (required)
+  ASOR_EVENTS_EXCHANGE           Topic exchange name (default: asor.events)
   ASOR_MODEL                     Optional model alias (auto, pro, flash, flash-lite)
   ASOR_EXTENSIONS                Optional comma-separated extension names
+  ASOR_RUNNER_TIMEOUT_SECONDS    Soft timeout, default 180
+  ASOR_RESUME_SESSION_ID         Optional Gemini session id to resume
   GOOGLE_GENAI_USE_VERTEXAI      Required: "true"
   GOOGLE_CLOUD_PROJECT           Required: GCP project id
   GOOGLE_CLOUD_LOCATION          Required: e.g. "us-central1"
@@ -32,9 +36,10 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 
-import httpx
+import pika
 
 
 def _env(name: str, *, required: bool = True, default: str | None = None) -> str:
@@ -49,8 +54,12 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _post_event(
-    client: httpx.Client, callback_url: str, run_id: str, seq: int, payload: dict
+def _publish_event(
+    channel: pika.adapters.blocking_connection.BlockingChannel,
+    exchange: str,
+    run_id: str,
+    seq: int,
+    payload: dict,
 ) -> None:
     kind = payload.get("type") or "message"
     body = {
@@ -60,10 +69,19 @@ def _post_event(
         "payload": payload,
         "at": _now_iso(),
     }
+    routing_key = f"run.{run_id}.{kind}"
     try:
-        client.post(callback_url, json=body, timeout=10.0)
-    except httpx.HTTPError as exc:
-        print(f"[asor-runner] callback failed seq={seq}: {exc}", file=sys.stderr)
+        channel.basic_publish(
+            exchange=exchange,
+            routing_key=routing_key,
+            body=json.dumps(body).encode("utf-8"),
+            properties=pika.BasicProperties(
+                content_type="application/json",
+                delivery_mode=2,
+            ),
+        )
+    except Exception as exc:
+        print(f"[asor-runner] publish failed seq={seq}: {exc}", file=sys.stderr)
 
 
 def _reader_fd(fd: int, lines: queue.Queue[str]) -> None:
@@ -97,10 +115,8 @@ def _ensure_checkpointing_enabled() -> bool:
 def main() -> int:
     run_id = _env("ASOR_RUN_ID")
     prompt = _env("ASOR_PROMPT")
-    callback_url = _env("ASOR_CALLBACK_URL")
-    # The model alias `auto` resolves to a preview model that isn't available in
-    # every Vertex region (e.g. europe-west4 / global). The orchestrator passes
-    # an explicit model in ASOR_MODEL — fall back to `flash` if it doesn't.
+    amqp_url = _env("ASOR_AMQP_URL")
+    events_exchange = _env("ASOR_EVENTS_EXCHANGE", required=False, default="asor.events")
     model = _env("ASOR_MODEL", required=False, default="flash")
     if model == "auto":
         model = "flash"
@@ -109,8 +125,6 @@ def main() -> int:
     resume_session_id = _env("ASOR_RESUME_SESSION_ID", required=False, default="")
     checkpointing_enabled = _ensure_checkpointing_enabled()
 
-    # Sanity-check Vertex/ADC auth so we fail loudly with a clear status event
-    # instead of letting Gemini CLI bail with a cryptic prompt.
     for required_auth in (
         "GOOGLE_GENAI_USE_VERTEXAI",
         "GOOGLE_CLOUD_PROJECT",
@@ -119,7 +133,6 @@ def main() -> int:
         if not os.environ.get(required_auth):
             print(f"[asor-runner] missing auth env var {required_auth}", file=sys.stderr)
     if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-        # Strip them — they would otherwise override ADC.
         os.environ.pop("GEMINI_API_KEY", None)
         os.environ.pop("GOOGLE_API_KEY", None)
 
@@ -149,11 +162,15 @@ def main() -> int:
 
     print(f"[asor-runner] launching: {' '.join(cmd[:6])} ...", file=sys.stderr)
 
+    connection = pika.BlockingConnection(pika.URLParameters(amqp_url))
+    channel = connection.channel()
+    channel.exchange_declare(exchange=events_exchange, exchange_type="topic", durable=True)
+
     seq = 1
-    with httpx.Client() as client:
-        _post_event(
-            client,
-            callback_url,
+    try:
+        _publish_event(
+            channel,
+            events_exchange,
             run_id,
             seq,
             {
@@ -200,7 +217,7 @@ def main() -> int:
                         + stderr_tail
                     )[-2000:],
                 }
-                _post_event(client, callback_url, run_id, seq, timeout_status)
+                _publish_event(channel, events_exchange, run_id, seq, timeout_status)
                 return 1
             try:
                 line = lines.get(timeout=1)
@@ -213,7 +230,7 @@ def main() -> int:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 payload = {"type": "message", "raw": line}
-            _post_event(client, callback_url, run_id, seq, payload)
+            _publish_event(channel, events_exchange, run_id, seq, payload)
             seq += 1
 
         rc = proc.wait()
@@ -225,7 +242,10 @@ def main() -> int:
         }
         if rc != 0 and stderr_tail:
             terminal["stderr_tail"] = stderr_tail
-        _post_event(client, callback_url, run_id, seq, terminal)
+        _publish_event(channel, events_exchange, run_id, seq, terminal)
+    finally:
+        with suppress(Exception):
+            connection.close()
 
     return 0 if rc == 0 else 1
 
