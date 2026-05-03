@@ -34,9 +34,7 @@ class AmqpClient:
         self._tasks_ex = await channel.declare_exchange(
             TASKS_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True
         )
-        await channel.declare_exchange(
-            EVENTS_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True
-        )
+        await channel.declare_exchange(EVENTS_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True)
         log.info("amqp connected: %s", self._url)
 
     async def close(self) -> None:
